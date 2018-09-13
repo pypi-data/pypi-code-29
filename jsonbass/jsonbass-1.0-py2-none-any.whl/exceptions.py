@@ -1,0 +1,2 @@
+class NoSuchColumnException(Exception):
+    pass
