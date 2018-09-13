@@ -1,0 +1,15 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+# @File : route.py
+# @Date : 2018/9/4 13:47
+# @Author: donghaixing
+# Do have a faith in what you're doing.
+# Make your life a story worth telling.
+
+from tornado_rest.apps.blog import handler
+
+
+def add_routes(api):
+    api.add_route("/", handler.IndexHandler)
+    api.add_route("/login", handler.LoginHandler)
+    api.add_route("/logout", handler.LogoutHandler)
