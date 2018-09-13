@@ -1,0 +1,213 @@
+import os
+import time
+import logging
+import shutil
+import pandas as pd
+from datetime import datetime 
+from google.cloud import bigquery
+from google.cloud import storage
+from google.cloud.bigquery.table import Table
+from google.oauth2 import service_account
+
+
+class BigQueryExporter:
+    _use_cache = False
+    
+    @staticmethod
+    def use_cache(is_use_cache=True):
+        BigQueryExporter._use_cache = is_use_cache
+    
+    def __init__(self, project_name, dataset_name, bucket_name=None, log_lambda=None, key_file_path=None):
+        self.project_name = project_name
+        self.dataset_name = dataset_name
+        self.bucket_name = bucket_name
+        self.log_lambda = log_lambda
+
+        if key_file_path is not None:
+            credential = service_account.Credentials.from_service_account_file(key_file_path)
+        else:
+            credential = None
+
+        self.bigquery_client = bigquery.Client(project=project_name, credentials=credential)
+        self.storage_client = storage.Client(project=project_name, credentials=credential)
+
+    def query_to_table(self, query, job_name, dataset_name=None):
+        # external logging if required
+        if self.log_lambda is not None:
+            self.log_lambda(query)
+        
+        # Do nothing if use_cache
+        if BigQueryExporter._use_cache:
+            return
+        
+        #logging
+        logging.info('[BigQueryExporter] ['+job_name+'] ::query_to_table start')
+        startTime= datetime.now()
+        
+        # initialize variables
+        if dataset_name is None:
+            dataset_name = self.dataset_name
+        logging.info('[BigQueryExporter] ['+job_name+'] ::dataset is set to %s' % dataset_name )
+        bigquery_client = self.bigquery_client
+        
+        # Point to the dataset and table
+        destination_dataset = self.bigquery_client.dataset(dataset_name)
+        destination_table = destination_dataset.table(job_name)
+
+        # Create an empty table
+        try:
+            logging.info('[BigQueryExporter] ['+job_name+'] ::bigqueyr_client.get_table(%s) ...' % destination_table )
+            self.bigquery_client.get_table(destination_table)
+            logging.info('[BigQueryExporter] ['+job_name+'] ::bigqueyr_client.delete_table(%s) ...' % destination_table )
+            self.bigquery_client.delete_table(destination_table)
+        except:
+            logging.info('[BigQueryExporter] ['+job_name+'] ::execption point 01 ...(%s)' % dataset_name )
+            pass
+        logging.info('[BigQueryExporter] ['+job_name+'] ::bigqueyr_client.create_table( Table( %s ) ) ...' % destination_table )
+        self.bigquery_client.create_table(Table(destination_table))
+        # destination_table.create()
+        
+        # Execute the job and save to table
+        # unique_id = str(uuid.uuid4())
+        # job = bigquery_client.run_async_query(unique_id, query)
+        job_config = bigquery.QueryJobConfig()
+        job_config.allow_large_results = True
+        job_config.use_legacy_sql = False
+        job_config.destination = destination_table
+        
+        logging.info('[BigQueryExporter] ['+job_name+'] ::bigqueyr_client.query() starts ...' )
+        logging.info('[BigQueryExporter] ['+job_name+'] ::job_config: %s' % str(job_config) )
+        job = self.bigquery_client.query(query, job_config=job_config)
+        
+        # Wait till the job done
+        while not job.done():
+            time.sleep(1)
+        
+        # logging
+        timeElapsed=datetime.now()-startTime 
+        logging.info('[BigQueryExporter] ['+job_name+'] ::query_to_table completed, elpased {}s'.format(timeElapsed.seconds))
+        
+        return destination_table
+
+    def table_to_gs(self, destination_table, job_name, bucket_name=None):
+        #logging
+        logging.info('[BigQueryExporter] ['+job_name+'] ::table_to_gs start')
+        startTime= datetime.now()
+        
+        # initialize variables
+        bigquery_client = self.bigquery_client
+        storage_client = self.storage_client
+
+        if bucket_name is None:
+            bucket_name = self.bucket_name
+
+        if bucket_name is None:
+            raise Exception('No bucket name defined, either pass it with function call or when initializing BigQueryExporter.')
+
+        # Create Bucket if needed
+        try:
+            bucket = storage_client.get_bucket(bucket_name)
+        except:
+            logging.info('[BigQueryExporter] [' + job_name + '] ::Bucket not found, create a new one.')
+            bucket = storage_client.create_bucket(bucket_name, project=self.project_name)
+
+        # Create empty folder
+        blobs = list(bucket.list_blobs(prefix=job_name))
+        for blob in blobs:
+            blob.delete()
+        
+        # Execute the job and save to google storage
+        # unique_id = str(uuid.uuid4())
+        file_destination = 'gs://' +bucket_name+ '/' +job_name+ '/out-*.csv'
+        # job = bigquery_client.extract_table_to_storage(unique_id, destination_table, file_destination)
+        job = bigquery_client.extract_table(destination_table, file_destination)
+        # job.begin()
+        
+        # Wait till the job done
+        while not job.done():
+            time.sleep(1)
+            
+        # logging
+        timeElapsed = datetime.now()-startTime
+        logging.info('[BigQueryExporter] ['+job_name+'] ::table_to_gs completed, elpased {}s'.format(timeElapsed.seconds))
+        
+        return bucket
+
+    def gs_to_local(self, bucket, job_name, data_dir_path):
+        #logging
+        logging.info('[BigQueryExporter] ['+job_name+'] ::gs_to_local start')
+        startTime = datetime.now()
+        
+        # initialize variables
+        dir_path = data_dir_path + '/' + job_name
+        
+        # Point to the folders in google storage
+        blobs = list(bucket.list_blobs(prefix=job_name))
+        
+        # Create empty folder
+        if os.path.isdir(dir_path):
+            shutil.rmtree(dir_path)
+        os.mkdir(dir_path)
+        
+        # Export the files in google storage to local
+        for blob in blobs:
+            name = blob.name.split('/')[-1]
+            blob.download_to_filename(dir_path + '/' + name)
+
+        # logging
+        timeElapsed=datetime.now() - startTime
+        logging.info('[BigQueryExporter] ['+job_name+'] ::gs_to_local completed, elpased {}s'.format(timeElapsed.seconds))
+        
+    def query_to_gs(self, query, job_name, bucket_name=None):
+        # Do nothing if use_cache
+        if BigQueryExporter._use_cache:
+            return
+        
+        #logging
+        logging.info('[BigQueryExporter] ['+job_name+'] ::query_to_gs start')
+        startTime = datetime.now()
+        
+        destination_table = self.query_to_table(query, job_name)
+        self.table_to_gs(destination_table, job_name=job_name, bucket_name=bucket_name)
+        
+        # logging
+        timeElapsed=datetime.now()-startTime 
+        logging.info('[BigQueryExporter] ['+job_name+'] ::query_to_gs completed, elpased {}s'.format(timeElapsed.seconds))
+
+    def query_to_local(self, query, job_name, data_dir_path):
+        # Do nothing if use_cache
+        if BigQueryExporter._use_cache:
+            return
+        
+        #logging
+        logging.info('[BigQueryExporter] ['+job_name+'] ::query_to_local start')
+        startTime = datetime.now()
+        
+        destination_table = self.query_to_table(query, job_name)
+        bucket = self.table_to_gs(destination_table, job_name)
+        self.gs_to_local(bucket, job_name, data_dir_path)
+        
+        # logging
+        timeElapsed = datetime.now()-startTime
+        logging.info('[BigQueryExporter] ['+job_name+'] ::query_to_local completed, elpased {}s'.format(timeElapsed.seconds))
+
+    def query_to_memory(self, query):
+        # external logging if required
+        if self.log_lambda is not None:
+            self.log_lambda(query)
+        
+        # job_config = bigquery.QueryJobConfig()
+        # job_config.use_legacy_sql = False
+        
+        iterator = self.bigquery_client.query(query)
+        rows = list(iterator)
+        
+        return rows
+    
+    def query_to_df(self, query):
+        _ = self.query_to_memory(query)
+        __ = _[0]
+        columns = [k for (k, v) in __.items()]
+        values = [[v for (k, v) in __.items()] for __ in _]
+        df = pd.DataFrame(values, columns=columns)
+        return df
