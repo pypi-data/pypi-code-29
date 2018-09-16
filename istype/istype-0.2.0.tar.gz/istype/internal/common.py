@@ -1,0 +1,112 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+#
+# Copyright (c) 2017~2999 - cologler <skyoflw@gmail.com>
+# ----------
+#
+# ----------
+
+import contextlib
+from typing import Union
+
+
+class MatchContext:
+    def __init__(self):
+        self._type_vars = None
+        self._route_stack = []
+
+    @property
+    def type_vars(self):
+        if self._type_vars is None:
+            self._type_vars = {}
+        return self._type_vars
+
+    def then_call(self, func):
+        @contextlib.contextmanager
+        def _():
+            self._route_stack.append(func)
+            yield
+            self._route_stack.pop()
+        return _()
+
+    def current_call(self):
+        return self._route_stack[-1]
+
+
+class TypeMatcher:
+    _INSTANCECHECK_HOOKS = {}
+    _SUBCLASSCHECK_HOOKS = {}
+
+    check_tuple_elements = True
+
+    check_list_elements = True
+    check_collection_elements = True
+    check_set_elements = True
+    check_frozenset_elements = True
+    check_iterable_elements = False
+
+    check_dict_elements = True
+    check_mapping_elements = True
+    check_mutablemapping_elements = True
+
+    @staticmethod
+    def python_instancecheck(self, ctx, types: Union[type, tuple], obj: object) -> bool:
+        return isinstance(obj, types)
+
+    @staticmethod
+    def python_subclasscheck(self, ctx, types: Union[type, tuple], cls: type) -> bool:
+        return issubclass(cls, types)
+
+    def isinstance(self, obj: object, types: Union[type, tuple], *, ctx=None) -> bool:
+        types_cls = type(types)
+        checker = self._INSTANCECHECK_HOOKS.get(types_cls, TypeMatcher.python_instancecheck)
+        ctx = ctx or MatchContext()
+        with ctx.then_call(checker):
+            return checker(self, ctx, types, obj)
+
+    def issubclass(self, obj: object, types: Union[type, tuple], *, ctx=None) -> bool:
+        types_cls = type(types)
+        checker = self._SUBCLASSCHECK_HOOKS.get(types_cls, TypeMatcher.python_subclasscheck)
+        ctx = ctx or MatchContext()
+        with ctx.then_call(checker):
+            return checker(self, ctx, types, obj)
+
+    @classmethod
+    def hook_instance_check(cls, type_: type):
+        def register(func):
+            assert type_ not in cls._INSTANCECHECK_HOOKS
+            cls._INSTANCECHECK_HOOKS[type_] = func
+            return func
+        return register
+
+    @classmethod
+    def hook_subclass_check(cls, type_: type):
+        def register(func):
+            assert type_ not in cls._SUBCLASSCHECK_HOOKS
+            cls._SUBCLASSCHECK_HOOKS[type_] = func
+            return func
+        return register
+
+
+class Router:
+    def __init__(self, func):
+        self._func = func
+        self._route_paths = {}
+
+    def __call__(self, matcher: TypeMatcher, ctx: MatchContext, type_, obj: object):
+        next_call = self._func(matcher, ctx, type_, obj)
+        with ctx.then_call(next_call):
+            return next_call(matcher, ctx, type_, obj)
+
+    def route(self, key):
+        def _(func):
+            assert key not in self._route_paths
+            self._route_paths[key] = func
+            return func
+        return _
+
+    def get(self, key, d):
+        try:
+            return self._route_paths[key]
+        except KeyError:
+            return d
