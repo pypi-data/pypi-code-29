@@ -1,0 +1,6 @@
+from .udp_interface import get_mac_addresses
+from .utils import pretty_print_dictionary
+
+if __name__ == '__main__':
+    addresses = get_mac_addresses()
+    print pretty_print_dictionary(addresses)
