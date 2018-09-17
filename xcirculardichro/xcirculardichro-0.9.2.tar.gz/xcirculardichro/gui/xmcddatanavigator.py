@@ -1,0 +1,132 @@
+'''
+ Copyright (c) 2017, UChicago Argonne, LLC
+ See LICENSE file.
+'''
+import logging
+
+import PyQt5.QtWidgets as qtWidgets
+import PyQt5.QtCore as qtCore
+from xcirculardichro import METHOD_ENTER_STR, METHOD_EXIT_STR
+from xcirculardichro.gui.model import XMCDDataNavigatorModel
+from xcirculardichro.data import DataNode
+from xcirculardichro.data import SpecFileDataNode
+from xcirculardichro.data import IntermediateDataNode,\
+    SELECTED_NODES, DATA_SELECTION
+import gc
+logger = logging.getLogger(__name__)
+print ("XMCDDataNavigator Logger %s" %logger)
+
+print ("xmcddatanavigator.__name__ %s" % __name__)
+print ("METHOD_ENTER_STR %s" %METHOD_ENTER_STR)
+
+class XMCDDataNavigator(qtWidgets.QWidget):
+    
+    dataSelectionChanged = qtCore.pyqtSignal(list, name="dataSelectionChanged")
+
+    def __init__(self, parent=None):
+        super(XMCDDataNavigator, self).__init__(parent=parent)
+        logger.error(METHOD_ENTER_STR)
+        layout = qtWidgets.QHBoxLayout()
+
+        self._rootNode = DataNode("/")
+        self._model = XMCDDataNavigatorModel(self._rootNode)
+        self._view = qtWidgets.QTreeView()
+        self._view.setHeaderHidden(True)
+        self._view.setModel(self._model)
+        self._view.setSelectionMode(qtWidgets.QAbstractItemView.NoSelection)
+        self._view.setMinimumWidth(200)
+        layout.addWidget(self._view)
+        self.setLayout(layout)
+
+        # connect up signals
+        #self._view.selectionModel().selectionChanged.connect(self.selectionChanged)
+            
+    def addDataNode(self, nodeName):
+        logger.debug(METHOD_ENTER_STR % nodeName)
+        self._rootNode.addChild(DataNode(nodeName))
+        numCurrentNodes = self._rootNode.childCount()
+        logger.debug("starting to insertRows")
+        self._model.insertRows(numCurrentNodes, 1)
+        logger.debug(METHOD_EXIT_STR)
+
+    def addSpecDataFileNode(self, specDataFile):
+        logger.debug(METHOD_ENTER_STR % specDataFile)
+        specNode = SpecFileDataNode(specDataFile, parent=self._rootNode)
+        specNode.setChecked(True)
+        numCurrentNodes = self._rootNode.childCount()
+        self._model.insertRows(numCurrentNodes, 1)
+        
+    def addIntermediateDataNode(self, dataSelection, option=None):
+        logger.debug(METHOD_ENTER_STR % dataSelection)
+        dataInfo = {SELECTED_NODES: self.getSelectedNodes(), 
+                    DATA_SELECTION: dataSelection}
+        node = IntermediateDataNode(dataInfo, parent = self._rootNode, \
+                                    option=option)
+        numCurrentNodes = self._rootNode.childCount()
+        self._model.insertRows(numCurrentNodes, 1)
+        
+    def getSelectedNodes(self):
+        logger.debug(METHOD_ENTER_STR)
+        root = self._rootNode
+        selectedNodes = []
+        for node in root._children:
+            if node.isChecked():
+                selectedNodes.append(node)
+        return selectedNodes
+        
+    def model(self):
+        '''
+        return the data model for the view
+        '''
+        return self._model
+    
+    def reloadSpecFile(self):
+        logger.debug(METHOD_ENTER_STR)
+        print("PRINT RELOAD_SPEC_FILE")
+        selectedNodes = self.getSelectedNodes()
+        if len(selectedNodes) == 1 and \
+            isinstance(selectedNodes[0], SpecFileDataNode):
+            logger.debug("Yes we need to reload a Spec node")
+            print("Yes we need to reload a Spec node")
+            selectedNodes[0].reload()
+            gc.collect()
+            self._model.dataChanged.emit(self._model.index(selectedNodes[0].row(),0),
+                                         self._model.index(selectedNodes[0].row(),0))
+        else:
+            logger.debug("Somehow managed to ask to reload a spec node" +
+                         "without selecting one")
+               
+    def removeSelectedNodes(self):
+        logger.debug(METHOD_ENTER_STR)
+        selectedNodes = self.getSelectedNodes()
+        for node in selectedNodes:
+            logger.debug("REMOVING NODE %s" % node)
+            node.setChecked(False)
+            self.model().removeRow(node.row())
+        
+        
+    def rootNode(self):
+        '''
+        return the root node of the navigator.  This is essentially just a dummy 
+        place holder node.  It will serve as parent for all other nodes.
+        '''
+        return self._rootNode
+    
+    def selectionChanged(self, selected, deselected):
+        logger.debug(METHOD_ENTER_STR % ((selected.indexes(),deselected.indexes()),))
+        logger.debug("Selected start")
+        for index in selected.indexes():
+            logger.debug("Selected Item: %s" % self._model.getNode(index))
+        logger.debug("Selected end")
+        logger.debug("Deselected start")
+        for index in deselected.indexes():
+            logger.debug("DeSeleced item: %s" %self._model.getNode(index))
+        logger.debug("Deselected End")
+
+    def view(self):
+        '''
+        return the model's view
+        '''
+        return self._view
+    
+    
