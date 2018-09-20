@@ -1,0 +1,169 @@
+# ---------------------------------------------------------
+# Copyright (c) Microsoft Corporation. All rights reserved.
+# ---------------------------------------------------------
+
+"""The HyperDrive Run object."""
+import enum
+
+from azureml.core import Run, ScriptRun
+from azureml.exceptions import TrainingException
+from azureml._base_sdk_common.service_discovery import get_history_service_url
+
+from azureml.train._run_history_service_client import _RunHistoryServiceClient
+import azureml.train.restclients.hyperdrive as HyperDriveClient
+from azureml.train.restclients.hyperdrive.rest import ApiException
+
+
+class PrimaryMetricGoal(enum.Enum):
+    """The supported metric goals.
+
+    A metric goal is used to determine whether a higher value for a metric is better or worse. This is used when
+    comparing runs based on the primary metric. For example, you may want to maximize accuracy or minimize error.
+    """
+
+    MAXIMIZE = "MAXIMIZE"
+    MINIMIZE = "MINIMIZE"
+
+
+class HyperDriveRun(ScriptRun):
+    """HyperDriveRun contains the details of a submitted HyperDrive experiment.
+
+    This class can be used to manage, check status, and retrieve run details for the HyperDrive run and each of
+    the generated child runs.
+
+    :param experiment: The Experiment for the HyperDrive run.
+    :type experiment: azureml.core.experiment.Experiment
+    :param run_id: The HyperDrive run id.
+    :type run_id: str
+    :param run_config: The RunConfiguration used by the estimator in HyperDriveRunConfig.
+    :type run_config: azureml.core.runconfig.RunConfiguration
+    :param hyperdrive_run_config: A `HyperDriveRunConfig` that defines the configuration for this HyperDrive run.
+    :type hyperdrive_run_config: azureml.train.hyperdrive.HyperDriveRunConfig
+
+    """
+
+    def __init__(self, experiment, run_id, run_config, hyperdrive_run_config):
+        """Initialize a HyperDrive run.
+
+        :param experiment: The Experiment for the HyperDrive run.
+        :type experiment: azureml.core.experiment.Experiment
+        :param run_id: The Hyperdrive run id.
+        :type run_id: str
+        :param run_config: The RunConfiguration used by the estimator in HyperDriveRunConfig.
+        :type run_config: azureml.core.runconfig.RunConfiguration
+        :param hyperdrive_run_config: A `HyperDriveRunConfig` that defines the configuration for this HyperDrive run.
+        :type hyperdrive_run_config: azureml.train.hyperdrive.HyperDriveRunConfig
+        """
+        super().__init__(experiment=experiment, run_id=run_id,
+                         directory=hyperdrive_run_config.estimator.source_directory, _run_config=run_config)
+        self._hyperdrive_run_config = hyperdrive_run_config
+
+    @property
+    def hyperdrive_run_config(self):
+        """Return the hyperdrive run config.
+
+        :return: The hyperdrive run config.
+        :rtype: azureml.train.hyperdrive.HyperDriveRunConfig
+        """
+        return self._hyperdrive_run_config
+
+    def cancel(self, workspace, run_name):
+        """Return True if the HyperDrive run was cancelled successfully.
+
+        :param workspace: The workspace.
+        :type workspace: azureml.core.workspace.Workspace
+        :param run_name: The name of the run to cancel.
+        :type run_name: str
+        :return: Whether or not the run was cancelled successfully.
+        :rtype: bool
+        """
+        project_context = self.hyperdrive_run_config._get_project_context(workspace, run_name)
+        project_auth = self.experiment.workspace._auth_object
+        run_history_host = get_history_service_url(project_auth, project_context.get_workspace_uri_path())
+        HyperDriveClient.configuration.host = self.hyperdrive_run_config._get_host_url(workspace, run_name)
+        api_instance = HyperDriveClient.ExperimentApi()
+
+        try:
+            # FIXME: remove this fix once hyperdrive code updates ES URL creation
+            # project_context.get_experiment_uri_path() gives /subscriptionid/id_value
+            # where as hyperdrive expects subscriptionid/id_value
+            # project_context.get_experiment_uri_path()
+            experiment_uri_path = project_context.get_experiment_uri_path()[1:]
+            cancel_hyperdrive_run_result = api_instance.cancel_experiment(experiment_uri_path,
+                                                                          self._run_id,
+                                                                          project_auth.get_authentication_header()
+                                                                          ["Authorization"],
+                                                                          run_history_host)
+            return cancel_hyperdrive_run_result
+        except ApiException as e:
+            raise TrainingException("Exception occurred while cancelling HyperDrive run. {}".format(str(e)),
+                                    inner_exception=e) from None
+
+    def get_best_run_by_primary_metric(self):
+        """Find and return the Run instance that corresponds to the best performing run amongst all the completed runs.
+
+        The best performing run is identified solely based on the primary metric parameter specified in the
+        HyperDriveRunConfig. The PrimaryMetricGoal governs whether the minimum or maximum of the primary metric is
+        used. To do a more detailed analysis of all the ExperimentRun metrics launched by this HyperDriveRun, use
+        get_metrics. If all of the Runs launched by this HyperDrive run reached the same best metric, only one of the
+        runs is returned.
+
+        It ignores any run that is cancelled by HyperDrive or failed due to error.
+
+        :return: The best Run.
+        :rtype: azureml.core.run.Run
+        """
+        # If none of the child runs has logged metrics, no metrics will be logged in History.
+        if not self.get_metrics():
+            raise TrainingException("No metrics have been logged for the ExperimentRuns launched by "
+                                    "this HyperDriveRun.")
+
+        best_run_id = self._get_best_run_id_by_primary_metric()
+        if best_run_id:
+            return Run(self.experiment,
+                       self._get_best_run_id_by_primary_metric())
+        else:
+            raise TrainingException("None of the ExperimentRuns launched by this HyperDrive run have logged the "
+                                    "primary metric yet.")
+
+    def _get_best_run_id_by_primary_metric(self):
+
+        child_run_metrics = self.get_metrics()
+        metric_name = self.hyperdrive_run_config._primary_metric_config["name"]
+        metric_goal = self.hyperdrive_run_config._primary_metric_config["goal"]
+        best_run_metrics = {}
+        metric_func = max if metric_goal == PrimaryMetricGoal.MAXIMIZE.value.lower() else min
+
+        for run in self.get_children():
+            if run.get_status() not in ["Failed", "Canceled"]:
+                run_metrics = child_run_metrics.get(run.id)
+                if run_metrics and metric_name in run_metrics:
+                    run_metrics_by_metric_name = run_metrics.get(metric_name)
+                    best_run_metrics[run.id] = metric_func(run_metrics_by_metric_name) \
+                        if isinstance(run_metrics_by_metric_name, list) else run_metrics_by_metric_name
+
+        if best_run_metrics:
+            best_run_id = metric_func(best_run_metrics, key=lambda k: best_run_metrics.get(k))
+            return best_run_id
+        else:
+            return None
+
+    def get_metrics(self):
+        """Return the metrics from all the runs that were launched by this HyperDriveRun.
+
+        :return: The metrics for all the children of this run.
+        :rtype: dict
+        """
+        run_history_client = _RunHistoryServiceClient(self.experiment)
+        return run_history_client.get_metrics_by_run_ids([run.id
+                                                          for run in self.get_children()])
+
+    # get_diagnostics looks for a zip in AFS based on run_id.
+    # For HyperDrive runs, there is no entry in AFS.
+    def get_diagnostics(self):
+        """The get_diagnostics method is not supported for the HyperDriveRun subclass."""
+        raise NotImplementedError("Get diagnostics is unsupported for HyperDrive run.")
+
+    def fail(self):
+        """The fail method is not supported for the HyperDriveRun subclass."""
+        raise NotImplementedError("Fail is unsupported for HyperDrive run.")
