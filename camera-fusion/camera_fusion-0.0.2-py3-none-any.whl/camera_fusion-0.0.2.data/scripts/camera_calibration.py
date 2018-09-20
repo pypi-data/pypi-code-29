@@ -1,0 +1,108 @@
+#!python
+# -*- coding: utf-8 -*-
+
+"""Calibration of the lens correction of a Camera.
+
+  Usage:
+    python3 camera-calibration.py -i 0
+
+"""
+
+from camera-fusion import Camera
+
+import argparse
+import sys
+try:
+    import cv2
+except ImportError:
+    print("ERROR python-opencv must be installed!")
+    exit(1)
+
+
+def main(argv):
+    """Setup, calibrate and live display a camera."""
+    # Get default camera id based on current platform.
+    if sys.platform == 'linux' or sys.platform == 'linux2':
+        default_cam_id = '/dev/video0'
+    else:  # darwin win32 win64
+        default_cam_id = 0
+
+    # Parse CLI arguments
+    ap = argparse.ArgumentParser()
+    ap.add_argument('-i', '--cam_id', default=default_cam_id,
+                    help="camera id (ex: ='/dev/video0'")
+    # TODO: implement dict argument parsing settings
+    ap.add_argument('-s', '--settings',
+                    help="'camera settings (ex: ='[(3, 640), (4, 480)]'")
+    args = vars(ap.parse_args())
+
+    # Default camera settings
+    if args['settings']:
+        settings = args['settings']
+    else:
+        settings = [(cv2.CAP_PROP_FRAME_WIDTH, 1280),
+                    (cv2.CAP_PROP_FRAME_HEIGHT, 720),
+                    (cv2.CAP_PROP_FPS, 30),
+                    (cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'MJPG')),
+                    (cv2.CAP_PROP_AUTOFOCUS, 1)]
+
+    # Initialize Camera object with calibration and lens correction
+    if sys.platform == 'linux' or sys.platform == 'linux2':
+        cam_id = args['cam_id']
+    else:
+        cam_id = int(args['cam_id'])
+    print('Setting up camera %s.' % cam_id)
+
+    aruco_dict_num = cv2.aruco.DICT_6X6_1000
+    # also available: DICT_5X5_1000, DICT_4X4_50, DICT_ARUCO_ORIGINAL
+
+    cam = Camera(cam_id=cam_id, aruco_dict_num=aruco_dict_num,
+                 settings=settings)
+
+    # Open basic live view
+    print('Live view running...')
+    print('  k to calibrate correction')
+    print('  s to save a frame')
+    print('  p toggle posture estimation')
+    print('  u toggle undistored frame')
+    print('  ESC or q to exit.')
+
+    reader = cam.estimate_board_and_markers_posture
+    # TODO: add info text on toggle
+    t0 = time.time()
+    while True:
+        frame = reader()
+
+        # Compute FPS:
+        frame = cam.draw_text(frame, '%d fps' % (1.0 / (time.time() - t0)),
+                              x=cam.width/35, y=cam.height - cam.height/20)
+        t0 = time.time()
+        cv2.imshow("Live camera", frame)
+        k = cv2.waitKey(33) % 256
+        if k == 27 or k == ord('q'):
+            break
+        elif k == ord('k'):
+            print("\nStarting camera %s correction calibration.." % cam.cam_id)
+            cam.calibrate_camera_correction()
+        elif k == ord('p'):
+            print('Toggle posture estimation.')
+            if reader == cam.estimate_board_and_markers_posture:
+                reader = cam.read
+            else:
+                reader = cam.estimate_board_and_markers_posture
+        elif k == ord('s'):
+            print('Image saved to frame_%s.png!' % cam.cam_id)
+            cv2.imwrite('frame_%s.png' % cam.cam_id, frame)
+        elif k == ord('u'):
+            print('Toggle undistored frame.')
+            if reader == cam.read_undistort:
+                reader = cam.read
+            else:
+                reader = cam.read_undistort
+
+    cam.release()  # DO NOT FORGET TO RELEASE!
+    cv2.destroyAllWindows()
+
+
+if __name__ == '__main__':
+    main(sys.argv[1:])
