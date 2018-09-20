@@ -1,0 +1,6 @@
+__title__ = "mailpapa"
+__description__ = "Emails in the Wild"
+__url__ = "https://github.com/mainanick/mailpapa"
+__version__ = "0.00.1"
+__author__ = "Maina Nick"
+__author_email__ = "contact@nickmaina.com"
