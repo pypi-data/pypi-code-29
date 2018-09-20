@@ -1,0 +1,15 @@
+#!/usr/bin/env python
+
+from setuptools import setup, find_packages
+
+setup(
+    name = 'vandroguard',
+    version = '1.5.1',
+    packages = find_packages(),
+    scripts = ['androaxml.py', 'androcsign.py', 'androdiff.py', 'androgexf.py',
+               'androlyze.py', 'andromercury.py', 'androrisk.py', 'androsign.py',
+               'androsim.py', 'androxgmml.py', 'apkviewer.py',
+               'androdd.py', 'androapkinfo.py',
+               ],
+    install_requires=['distribute'],
+)
