@@ -1,0 +1,629 @@
+# ---------------------------------------------------------
+# Copyright (c) Microsoft Corporation. All rights reserved.
+# ---------------------------------------------------------
+"""
+Utility methods for validation and conversion.
+"""
+from . import constants
+from . import _constants_azureml
+from .constants import NumericalDtype, Metric
+from .exceptions import DataException, ServiceException
+from ._metrics import minimize_or_maximize
+import collections
+import numpy as np
+import pandas as pd
+import os
+import scipy
+import sys
+import traceback
+import warnings
+import pandas.api as api
+import pkg_resources
+
+
+def get_value_int(intstring):
+    """
+    Convert string value to int.
+
+    :param intstring: The input value to be converted.
+    :type intstring: str
+    :return: The converted value.
+    :rtype: int
+    """
+    if intstring is not None and intstring is not '':
+        return int(intstring)
+    return intstring
+
+
+def get_value_float(floatstring):
+    """
+    Convert string value to float.
+
+    :param intstring: The input value to be converted.
+    :type intstring: str
+    :return: The converted value.
+    :rtype: float
+    """
+    if floatstring is not None and floatstring is not '':
+        return float(floatstring)
+    return floatstring
+
+
+def get_value_from_dict(dictionary, names, default_value):
+    """
+    Get the value of a configuration item that has a list of names.
+
+    :param dictionary: Dictory of settings with key value pair to look the data for.
+    :param names: The list of names for the item looking foi.
+    :param default_value: Default value to return if no matching key found
+    :return: Returns the first value from the list of names.
+    """
+    for key in names:
+        if key in dictionary:
+            return dictionary[key]
+    return default_value
+
+
+def extract_user_data(user_script):
+    """
+    Extracts data from user's module containing get_data().
+    This method is automatically executing during and AutoML experiment.
+
+    :param user_script: Python module containing get_data() function.
+    :return: Dictionary containing
+        X_train, y_train, sample_weight, X_valid, y_valid, sample_weight_valid, cv_splits_indices.
+    """
+    if user_script is None:
+        raise ValueError("Get data script was not defined and X, y inputs were not provided.")
+    try:
+        output = user_script.get_data()
+    except Exception:
+        raise DataException("Could not execute get_data() from user script.") from None
+    if isinstance(output, dict):
+        return _extract_data_from_dict(output)
+    elif isinstance(output, tuple):
+        return _extract_data_from_tuple(output)
+    else:
+        raise DataException("Could not extract data from user script.")
+
+
+def _y_nan_check(output=None):
+    y = output['y']
+    X = output['X']
+    sample_weight = output['sample_weight']
+    if y is not None and pd.isnull(y).any():
+        warnings.warn("Labels contain NaN values. Removing for AutoML Experiment.")
+        y_indices_pruned = ~pd.isnull(y)
+        X_reduced = X[y_indices_pruned]
+        y_reduced = y[y_indices_pruned]
+        sample_weight_reduced = None
+        if sample_weight is not None:
+            sample_weight_reduced = sample_weight[y_indices_pruned]
+        if y_reduced.shape[0] is 0:
+            raise DataException('All label data is NaN.')
+        output['X'] = X_reduced
+        output['y'] = y_reduced
+        output['sample_weight'] = sample_weight_reduced
+    y_valid = output['y_valid']
+    X_valid = output['X_valid']
+    sample_weight_valid = output['sample_weight_valid']
+    if y_valid is not None and pd.isnull(y_valid).any():
+        warnings.warn("Validation Labels contain NaN values. Removing for AutoML Experiment.")
+        y_valid_indices_pruned = ~pd.isnull(y_valid)
+        X_valid_reduced = X_valid[y_valid_indices_pruned]
+        y_valid_reduced = y_valid[y_valid_indices_pruned]
+        sample_weight_valid_reduced = None
+        if sample_weight_valid is not None:
+            sample_weight_valid_reduced = sample_weight_valid[y_valid_indices_pruned]
+        output['X_valid'] = X_valid_reduced
+        output['y_valid'] = y_valid_reduced
+        output['sample_weight_valid'] = sample_weight_valid_reduced
+    return output
+
+
+def _extract_data_from_tuple(output):
+    """
+    Extracts user data if it is passed as a tuple
+    :param output: tuple containing user data
+    :return: tuple containing X_train, y_train, X_test, y_test
+    """
+    X_valid, y_valid = None, None
+    if len(output) < 2:
+        raise DataException("Could not extract X, y from get_data() in user script. "
+                            "get_data only output {0} values.".format(len(output))) from None
+    x_raw_column_names = None
+    X = output[0]
+    y = output[1]
+    if isinstance(X, pd.DataFrame):
+        x_raw_column_names = X.columns.values
+        X = X.values
+    if isinstance(y, pd.DataFrame):
+        y = y.values
+
+    if len(output) >= 4:
+        X_valid = output[2]
+        y_valid = output[3]
+        if isinstance(y_valid, pd.DataFrame):
+            y_valid = y_valid.values
+        if isinstance(X_valid, pd.DataFrame):
+            X_valid = X_valid.values
+
+    return {
+        "X": X,
+        "y": y,
+        "sample_weight": None,
+        "x_raw_column_names": x_raw_column_names,
+        "X_valid": X_valid,
+        "y_valid": y_valid,
+        "sample_weight_valid": None,
+        "X_test": None,
+        "y_test": None,
+        "cv_splits_indices": None,
+    }
+
+
+def _extract_data_from_dict(output):
+    """
+    Extracts user data if it is passed as a dictionary
+    :param output: dictionary containing user data and metadata
+    :return: Dictionary containing AutoML relevant data
+    """
+    X = get_value_from_dict(output, ['X'], None)
+    y = get_value_from_dict(output, ['y'], None)
+    sample_weight = get_value_from_dict(output, ['sample_weight'], None)
+    X_valid = get_value_from_dict(output, ['X_valid'], None)
+    y_valid = get_value_from_dict(output, ['y_valid'], None)
+    sample_weight_valid = get_value_from_dict(output, ['sample_weight_valid'], None)
+    X_test = get_value_from_dict(output, ['X_test'], None)
+    y_test = get_value_from_dict(output, ['y_test'], None)
+    data = get_value_from_dict(output, ['data_train'], None)
+    columns = get_value_from_dict(output, ['columns'], None)
+    label = get_value_from_dict(output, ['label'], None)
+    cv_splits_indices = get_value_from_dict(dictionary=output,
+                                            names=["cv_splits_indices"], default_value=None)
+    x_raw_column_names = None
+
+    if data is not None:
+        if label is None and X is None and y is None:
+            raise DataException('Pandas data array received without a label. '
+                                'Please add a ''label'' element to the get_data() output.')
+        if not isinstance(label, list):
+            assert(isinstance(label, str) or isinstance(label, int))
+            label = [label]
+        y_extracted = data[label].values
+        X_extracted = data[data.columns.difference(label)]
+        if columns is not None:
+            X_extracted = X_extracted[X_extracted.columns.intersection(columns)]
+
+        if X is None and y is None:
+            X = X_extracted
+            y = y_extracted
+        else:
+            if np.array_equiv(X, X_extracted.values):
+                raise DataException("Different values for X and data were provided. "
+                                    "Please return either X and y or data and label.")
+            if np.array_equiv(y, y_extracted.values):
+                raise DataException("Different values for y and label were provided. "
+                                    "Please return either X and y or data and label.")
+    if isinstance(X, pd.DataFrame):
+        x_raw_column_names = X.columns.values
+        X = X.values
+    if isinstance(X_valid, pd.DataFrame):
+        X_valid = X_valid.values
+    if isinstance(X_test, pd.DataFrame):
+        X_test = X_test.values
+    if isinstance(y, pd.DataFrame):
+        y = y.values
+    if isinstance(y_valid, pd.DataFrame):
+        y_valid = y_valid.values
+    if isinstance(y_test, pd.DataFrame):
+        y_test = y_test.values
+
+    if X is None:
+        raise DataException("Could not retrieve X train data from get_data() call. "
+                            "Please ensure you are either returning either "
+                            "{X_train: <numpy array>, y_train: <numpy array>"
+                            "or {data: <pandas dataframe>, label: <string>")
+    if y is None:
+        raise DataException("Could not retrieve y train data from get_data() call. "
+                            "Please ensure you are either returning either "
+                            "{X_train: <numpy array>, y_train: <numpy array>"
+                            "or {data: <pandas dataframe>, label: <string>")
+
+    if (X_valid is None) is not (y_valid is None):
+        raise DataException('Received only one of X_valid or y_valid.'
+                            'Either both or neither value should be provided.')
+
+    return {
+        "X": X,
+        "y": y,
+        "x_raw_column_names": x_raw_column_names,
+        "sample_weight": sample_weight,
+        "X_valid": X_valid,
+        "y_valid": y_valid,
+        "sample_weight_valid": sample_weight_valid,
+        "X_test": X_test,
+        "y_test": y_test,
+        "cv_splits_indices": cv_splits_indices,
+    }
+
+
+def _log_traceback(exception, logger):
+    logger.error(exception)
+    logger.error(traceback.format_exc())
+
+
+def _make_printable(pipeline_obj):
+    pipeline_pretty = ''
+    if pipeline_obj is not None:
+        if isinstance(pipeline_obj, str):
+            pipeline_pretty = pipeline_obj
+        else:
+            for step in pipeline_obj.steps:
+                pipeline_pretty += ' ' + str(step[0])
+    return pipeline_pretty
+
+
+def _read_compute_file(run_configuration, path):
+    compute_dict = {}
+    try:
+        with open(os.path.join(path, "aml_config",
+                               "{}.compute".format(run_configuration))) as compute_file:
+            for line in compute_file:
+                key, value = line.strip().split(': ')
+                compute_dict[key] = value
+    except Exception as e:
+        # In the event that a compute has multiple defined run configs,
+        # i.e. docker.compute starts with docker-python.runconfig and docker-spark.runconfig
+        # TODO: need less brittle logic for this
+        run_compute = run_configuration.split('-')[0]
+        with open(os.path.join(path, "aml_config",
+                               "{}.compute".format(run_compute))) as compute_file:
+            for line in compute_file:
+                if line.startswith('#'):
+                    continue
+                key, value = line.strip().split(': ')
+                compute_dict[key] = value
+    return compute_dict
+
+
+def friendly_http_exception(exception, api_name):
+    """
+    This function returns a details exception for an http exception.
+
+    :param exception: Exception.
+    :param api_name: string.
+    :raise: ServiceException
+    """
+    try:
+        # Raise bug with msrest team that response.status_code is always 500
+        message = exception.message
+        substr = 'Received '
+        status_code = message[message.find(substr) + len(substr): message.find(substr) + len(substr) + 3]
+    except Exception:
+        raise exception
+
+    if status_code in _constants_azureml.HTTP_ERROR_MAP:
+        http_error = _constants_azureml.HTTP_ERROR_MAP[status_code]
+    else:
+        http_error = _constants_azureml.HTTP_ERROR_MAP['default']
+    if api_name in http_error:
+        error_message = http_error[api_name]
+    else:
+        error_message = http_error['default']
+    raise ServiceException("{0} error raised. {1}".format(http_error['Name'], error_message)) from exception
+
+
+def _get_column_data_type_as_str(array):
+    """
+    This function gets the type of ndarray by looking into the ndarray contents.
+    :param array: ndarray
+    :raise ValueError if array is not ndarray or not valid
+    :return: type of column as a string (integer, floating, string etc.)
+    """
+    # If the array is not valid, then throw exception
+    if array is None:
+        raise DataException("The input array is None")
+
+    # If the array is not an instance of ndarray, then throw exception
+    if not isinstance(array, np.ndarray):
+        raise DataException("Not an instance of ndarray")
+
+    # Ignore the Nans and then return the data type of the column
+    return api.types.infer_dtype(array[~pd.isnull(array)])
+
+
+def _check_if_column_data_type_is_numerical(data_type_as_string):
+    """
+    This function returns 'True' if the dtype returned is 'integer',
+    'floating', 'mixed-integer' or 'mixed-integer-float' and 'False' otherwise
+    :param data_type_as_string: string carrying the type from infer_dtype()
+    :return: boolean
+    """
+    if data_type_as_string in list(NumericalDtype.FULL_SET):
+        return True
+
+    return False
+
+
+def _check_if_column_data_type_is_int(data_type_as_string):
+    """
+    This function returns 'True' if the dtype returned is 'integer'
+    :return: boolean
+    """
+    if data_type_as_string == NumericalDtype.Integer:
+        return True
+
+    return False
+
+
+def _all_dependencies():
+    """
+    This method retrieves the packages from the site-packages folder by using pkg_resources
+    :return: A dict contains packages and their corresponding versions.
+    """
+    dependencies_versions = dict()
+    for d in pkg_resources.working_set:
+        dependencies_versions[d.key] = d.version
+    return dependencies_versions
+
+
+def _is_sdk_package(name):
+    """
+    This method checks if a package is in sdk by checking the whether the package
+    startswith('azureml').
+    """
+    return name.startswith('azureml')
+
+
+def get_sdk_dependencies(
+    all_dependencies_versions=None,
+    logger=None,
+    **kwargs
+):
+    """
+    This method returns that package-version dict.
+
+    :param all_dependencies_versions:
+        If None, then get all and filter only the sdk ones.
+        Else, only check within the that dict the sdk ones.
+    :param logger: The logger.
+    :return: The package-version dict.
+    """
+    sdk_dependencies_version = dict()
+    if all_dependencies_versions is None:
+        all_dependencies_versions = _all_dependencies()
+    for d in all_dependencies_versions:
+        if _is_sdk_package(d):
+            sdk_dependencies_version[d] = all_dependencies_versions[d]
+
+    return sdk_dependencies_version
+
+
+def _check_dependencies_versions(old_versions, new_versions):
+    """
+    This method checks the SDK packages between the training environment and
+    the predict environment. The it gives out 2 kinds of warning
+    combining sdk/not sdk with missing or version mismatch.
+    :param old_versions: Packages in the training environment.
+    :param new_versions: Packages in the predict environment.
+    :return: sdk_dependencies_mismatch, sdk_dependencies_missing,
+             other_depencies_mismatch, other_depencies_missing
+    """
+    sdk_dependencies_mismatch = set()
+    other_depencies_mismatch = set()
+    sdk_dependencies_missing = set()
+    other_depencies_missing = set()
+
+    for d in old_versions.keys():
+        if d in new_versions and old_versions[d] != new_versions[d]:
+            if _is_sdk_package(d):
+                sdk_dependencies_mismatch.add(d)
+            else:
+                other_depencies_mismatch.add(d)
+        elif d not in new_versions:
+            if _is_sdk_package(d):
+                sdk_dependencies_missing.add(d)
+            else:
+                other_depencies_missing.add(d)
+
+    return sdk_dependencies_mismatch, sdk_dependencies_missing, other_depencies_mismatch, other_depencies_missing
+
+
+def _check_x_y(x, y, automl_settings):
+    """
+    Validate input data.
+
+    :param x: input data. dataframe/ array/ sparse matrix
+    :param y: input labels. dataframe/series/array
+    :param automl_settings: automl settings
+    :raise: ValueError if data does not conform to accepted types and shapes
+    :return:
+    """
+    preprocess = automl_settings.preprocess
+    if not (((preprocess is True or preprocess == "True") and isinstance(x, pd.DataFrame)) or
+            isinstance(x, np.ndarray) or scipy.sparse.issparse(x)):
+        raise ValueError(
+            "x should be dataframe with preprocess set or numpy array or sparse matrix")
+
+    if not isinstance(y, np.ndarray):
+        raise ValueError("y should be numpy array")
+
+    if x.shape[0] != y.shape[0]:
+        raise ValueError("number of rows in x and y are not equal")
+
+    if len(y.shape) > 2 or (len(y.shape) == 2 and y.shape[1] != 1):
+        raise ValueError("y should be a vector Nx1")
+
+    if automl_settings.task_type == constants.Tasks.CLASSIFICATION:
+        if y.dtype.kind != 'i':
+            raise ValueError("Please label encode y as an integer array for classification")
+
+    if automl_settings.task_type == constants.Tasks.REGRESSION:
+        if not _check_if_column_data_type_is_numerical(_get_column_data_type_as_str(y)):
+            raise ValueError("Please make sure y is numerical before fitting for regression")
+
+
+def _check_dimensions(X, y, X_valid, y_valid, sample_weight, sample_weight_valid):
+    dimension_error_message = "Dimension mismatch for {0} data. Expecting {1} dimensional array, " \
+                              "but received {2} dimensional data."
+    feature_dimensions = 2
+    label_dimensions = 1
+    if isinstance(X, pd.DataFrame):
+        if X.values.ndim > feature_dimensions:
+            raise ValueError(dimension_error_message.format("X", feature_dimensions, X.values.ndim))
+    if isinstance(y, pd.DataFrame):
+        if y.shape[1] != label_dimensions:
+            raise ValueError(dimension_error_message.format("y", label_dimensions, X.values.ndim))
+    if isinstance(X_valid, pd.DataFrame):
+        if X_valid.values.ndim > feature_dimensions:
+            raise ValueError(dimension_error_message.format("X_valid", feature_dimensions, X.values.ndim))
+    if isinstance(y_valid, pd.DataFrame):
+        if y_valid.shape[1] != label_dimensions:
+            raise ValueError(dimension_error_message.format("y_valid", label_dimensions, X.values.ndim))
+    if isinstance(sample_weight, pd.DataFrame):
+        if sample_weight.shape[1] != label_dimensions:
+            raise ValueError(dimension_error_message.format("sample_weight", label_dimensions, X.values.ndim))
+    if isinstance(sample_weight_valid, pd.DataFrame):
+        if sample_weight_valid.shape[1] != label_dimensions:
+            raise ValueError(dimension_error_message.format("sample_weight_valid", label_dimensions, X.values.ndim))
+
+    if isinstance(X, np.ndarray):
+        if X.ndim > feature_dimensions:
+            raise ValueError(dimension_error_message.format("X", feature_dimensions, X.ndim))
+    if isinstance(y, np.ndarray):
+        if y.ndim != label_dimensions:
+            raise ValueError(dimension_error_message.format("y", label_dimensions, X.ndim))
+    if isinstance(X_valid, np.ndarray):
+        if X_valid.ndim > feature_dimensions:
+            raise ValueError(dimension_error_message.format("X_valid", feature_dimensions, X.ndim))
+    if isinstance(y_valid, np.ndarray):
+        if y_valid.ndim != label_dimensions:
+            raise ValueError(dimension_error_message.format("y_valid", label_dimensions, X.ndim))
+    if isinstance(sample_weight, np.ndarray):
+        if sample_weight.ndim != label_dimensions:
+            raise ValueError(dimension_error_message.format("sample_weight", label_dimensions, X.ndim))
+    if isinstance(sample_weight_valid, np.ndarray):
+        if sample_weight_valid.ndim != label_dimensions:
+            raise ValueError(dimension_error_message.format("sample_weight_valid", label_dimensions, X.ndim))
+
+    if X is not None and y is not None and X.shape[0] != y.shape[0]:
+        raise ValueError("X and y data do not have the same number of samples. "
+                         "X has {0} samples and y has {1} samples.".format(X.shape[0], y.shape[0]))
+    if X_valid is not None and y_valid is not None and X_valid.shape[0] != y_valid.shape[0]:
+        raise ValueError("X_valid and y_valid data do not have the same number of samples. "
+                         "X_valid has {0} samples and "
+                         "y_valid has {1} samples.".format(X_valid.shape[0], y_valid.shape[0]))
+    if sample_weight is not None and y is not None and sample_weight.shape[0] != y.shape[0]:
+        raise ValueError("sample_weight and y data do not have the same number of samples. "
+                         "sample_weight has {0} samples and "
+                         "y has {1} samples.".format(sample_weight.shape[0], y.shape[0]))
+    if sample_weight_valid is not None and y_valid is not None and sample_weight_valid.shape[0] != y_valid.shape[0]:
+        raise ValueError("sample_weight_valid and y_valid data do not have the same number of samples. "
+                         "sample_weight_valid has {0} samples and y_valid has {1} "
+                         "samples.".format(sample_weight.shape[0], y.shape[0]))
+
+
+def _check_sample_weight(x, sample_weight, x_name, sample_weight_name, automl_settings):
+    """
+    Validate sample_weight.
+
+    :param x:
+    :param sample_weight:
+    :raise ValueError if sample_weight has problems
+    :return:
+    """
+    if not isinstance(sample_weight, np.ndarray):
+        raise ValueError(sample_weight_name + " should be numpy array")
+
+    if x.shape[0] != len(sample_weight):
+        raise ValueError(sample_weight_name + " length should match length of " + x_name)
+
+    if len(sample_weight.shape) > 1:
+        raise ValueError(sample_weight_name + " should be a unidimensional vector")
+
+    if automl_settings.primary_metric in Metric.SAMPLE_WEIGHTS_UNSUPPORTED_SET:
+        raise ValueError("Sample weights is not supported for these primary metrics: {0}".format(
+            Metric.SAMPLE_WEIGHTS_UNSUPPORTED_SET))
+
+
+def _validate_training_data(
+        X, y, X_valid, y_valid, sample_weight, sample_weight_valid, cv_splits_indices, automl_settings):
+    _check_x_y(X, y, automl_settings)
+
+    # validate sample weights if not None
+    if sample_weight is not None:
+        _check_sample_weight(X, sample_weight, "X", "sample_weight", automl_settings)
+
+    if X_valid is not None and y_valid is None:
+        raise ValueError("X validation provided but y validation data is missing.")
+
+    if y_valid is not None and X_valid is None:
+        raise ValueError("y validation provided but X validation data is missing.")
+
+    if X_valid is not None and sample_weight is not None and sample_weight_valid is None:
+        raise ValueError("sample_weight_valid should be set to a valid value")
+
+    if sample_weight_valid is not None and X_valid is None:
+        raise ValueError("sample_weight_valid should only be set if X_valid is set")
+
+    if sample_weight_valid is not None:
+        _check_sample_weight(X_valid, sample_weight_valid, "X_valid", "sample_weight_valid", automl_settings)
+
+    _check_dimensions(
+        X=X, y=y, X_valid=X_valid, y_valid=y_valid,
+        sample_weight=sample_weight, sample_weight_valid=sample_weight_valid)
+
+    if X_valid is not None:
+        if automl_settings.n_cross_validations is not None and automl_settings.n_cross_validations > 0:
+            raise ValueError("Both custom validation data and n_cross_validations specified. "
+                             "If you are providing the training data, do not pass any n_cross_validations.")
+        if automl_settings.validation_size is not None and automl_settings.validation_size > 0.0:
+            raise ValueError("Both custom validation data and validation_size specified. "
+                             "If you are providing the training data, do not pass any validation_size.")
+        if automl_settings.task_type == constants.Tasks.CLASSIFICATION:
+            # y_valid should be a subset of y(training sample)
+            in_train = set(y)
+            in_valid = set(y_valid)
+            only_in_valid = in_valid - in_train
+            if len(only_in_valid) > 0:
+                raise ValueError(
+                    "y values in validation set should be a subset of "
+                    "y values of training set.")
+
+    if cv_splits_indices is not None:
+        if automl_settings.n_cross_validations is not None and automl_settings.n_cross_validations > 0:
+            raise ValueError("Both cv_splits_indices and n_cross_validations specified. "
+                             "If you are providing the indices to use to split your data. "
+                             "Do not pass any n_cross_validations.")
+        if automl_settings.validation_size is not None and automl_settings.validation_size > 0.0:
+            raise ValueError("Both cv_splits_indices and validation_size specified. "
+                             "If you are providing the indices to use to split your data. "
+                             "Do not pass any validation_size.")
+        if X_valid is not None:
+            raise ValueError("Both cv_splits_indices and custom split validation data specified. "
+                             "If you are providing the training data, do not pass any indices to split your data.")
+
+
+def _get_max_min_comparator(objective):
+    """
+    Returns a comparator either maximizing or minimizing two values
+    Will not handle nans
+    """
+
+    if objective == constants.OptimizerObjectives.MAXIMIZE:
+        def maximize(x, y):
+            if x >= y:
+                return x
+            else:
+                return y
+        return maximize
+    elif objective == constants.OptimizerObjectives.MINIMIZE:
+        def minimize(x, y):
+            if x <= y:
+                return x
+            else:
+                return y
+        return minimize
+    else:
+        raise ValueError("Maximization or Minimization could not be determined based on current metric.")
