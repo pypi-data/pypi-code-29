@@ -1,0 +1,137 @@
+from typing import List, Iterator
+import pandas as pd
+from rdsr_navigator.concept_name import ConceptName
+import rdsr_navigator.value_extractors as ves
+from rdsr_navigator.sr_exceptions import SrMissingContentException
+
+_VALUE_EXTRACTORS: List[ves.ValueExtractorBase] = [ves.CodeMeaningExtractor(),
+                                                   ves.MeasuredValuesExtractor(),
+                                                   ves.TextValueExtractor(),
+                                                   ves.UidExtractor(),
+                                                   ves.DateTimeExtractor()]
+
+class SrElement:
+    def __init__(self, dicom_data) -> None:
+        self._dicom_data = dicom_data
+
+    def __str__(self) -> str:
+        return str(self.concept_name)
+
+    def __repr__(self) -> str:
+        return repr(self.concept_name)
+
+    def __getitem__(self, concept_names: str) -> 'SrElement':
+        if type(concept_names) is not str and len(concept_names) > 1:
+            return self.get(*concept_names)
+
+        return self.get(concept_names)
+
+    def __truediv__(self, concept_name) -> 'SrElement':
+        return self.get(concept_name)
+
+    def __floordiv__(self, concept_name) -> Iterator['SrElement']:
+        return self.get_all(concept_name)
+
+    # Jupyter integration.
+    def _repr_html_(self):
+        table = pd.DataFrame(columns=['Code Value',
+                                      'Coding Scheme Designator',
+                                      'Code Meaning',
+                                      'Value'])
+
+        table = table.append({'Value': self.value}, ignore_index=True)
+
+        for entry in self.content:
+            concept_name = entry.concept_name
+            value = entry.value or ''
+            table = table.append({'Code Value': concept_name.code_value,
+                                  'Coding Scheme Designator': concept_name.coding_scheme_designator,
+                                  'Code Meaning': concept_name.code_meaning,
+                                  'Value': value}, ignore_index=True)
+        
+        return table.fillna('')._repr_html_()
+
+    # Properties.
+    @property
+    def concept_name(self) -> ConceptName:
+        '''
+            Concept name of this instance.
+        '''
+        assert_concept_name_code_sequence(self._dicom_data)
+        concept_name_code = self._dicom_data.ConceptNameCodeSequence[0]
+
+        return ConceptName(code_value=concept_name_code.CodeValue,
+                           code_meaning=snake_case(concept_name_code.CodeMeaning),
+                           coding_scheme_designator=concept_name_code.CodingSchemeDesignator)
+
+    @property
+    def content(self) -> List['SrElement']:
+        '''
+            Lists of all entries.
+        '''
+        if hasattr(self._dicom_data, 'ContentSequence'):
+            return [SrElement(content) for content in self._dicom_data.ContentSequence]
+
+        return []
+
+    @property
+    def value(self):
+        '''
+            Extracts the value if a value of supported data types exists. Otherwise, None is returned.
+        '''
+        return self.get_value()
+
+    # Methods.
+    def get_value(self):
+        for ve in _VALUE_EXTRACTORS:
+            if ve.can_extract(self._dicom_data):
+                return ve.extract_value(self._dicom_data)
+
+        return None
+
+    def get(self, *concept_names: str) -> 'SrElement':
+        '''
+            Returns the first entry with the specified concept name.
+            If no entry is found, a ValueError exception is raised.
+        '''
+        if len(concept_names) > 1:
+            return self._get_single(concept_names[0]).get(*concept_names[1:])
+
+        if len(concept_names) == 1:
+            return self._get_single(concept_names[0])
+
+        raise ValueError('Invalid argument.')
+
+    def _get_single(self, concept_name: str) -> 'SrElement':
+
+        if hasattr(self._dicom_data, 'ContentSequence'):
+            for content in self._dicom_data.ContentSequence:
+                sr_element = SrElement(content)
+
+                cn = sr_element.concept_name
+                if concept_name in (cn.code_meaning, '{0}:{1}'.format(cn.code_value, cn.coding_scheme_designator)):
+                    return sr_element
+
+        message = 'Could not find: "{0}"'.format(concept_name)
+        raise SrMissingContentException(message=message)
+
+    def get_all(self, concept_name: str) -> Iterator['SrElement']:
+        '''
+            Returns an iterator that iterates over entries with the specified concept name.
+        '''
+        if hasattr(self._dicom_data, 'ContentSequence'):
+            for content in self._dicom_data.ContentSequence:
+                sr_element = SrElement(content)
+
+                cn = sr_element.concept_name
+                if concept_name in (cn.code_meaning, cn.code_value):
+                    yield sr_element
+
+
+def assert_concept_name_code_sequence(dicom_data) -> None:
+    assert hasattr(dicom_data, 'ConceptNameCodeSequence')
+    assert len(dicom_data.ConceptNameCodeSequence) == 1
+
+
+def snake_case(s: str) -> str:
+    return s.lower().strip().replace(' ', '_')
