@@ -1,0 +1,2 @@
+class InvalidTokenGetter(Exception):
+    pass
