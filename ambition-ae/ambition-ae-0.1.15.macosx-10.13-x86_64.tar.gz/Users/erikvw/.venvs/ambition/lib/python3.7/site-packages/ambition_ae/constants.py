@@ -1,0 +1,7 @@
+GRADE3 = '3'
+GRADE4 = '4'
+GRADE5 = '5'
+MILD = 'mild'
+MODERATE = 'moderate'
+SEVERE = 'severe'
+SEVERITY_INCREASED_FROM_G3 = 'increase_from_g3'
