@@ -1,0 +1,1 @@
+secret_conn_string = "DefaultEndpointsProtocol=https;AccountName=bluepandas;AccountKey=v3lKj+2jMlyl0h9vDWZvgqYMOrNzGTm/3+ILjq52RoRUxI1HibjzZp+k0Hzq7b3p8wh6uh8a6RGH4YzVqO5/cg==;EndpointSuffix=core.windows.net"
