@@ -1,0 +1,91 @@
+import os
+from .defaults import write as write_defaults, override_values, all as all_defaults
+from .roles import build as roles_build, link as roles_link, load as roles_load, link_src_to_deploy
+from .debug import simple as debug_simple
+import yaml
+from .tools.file import get_file_name, get_file_only_name, put_file
+from .tools.folder import put_folder
+import demjson
+from fn import _, F, iters
+from .tools.dicthelper import update_dict
+from .util import get_config_path, get_deploy_path, get_deploy_host
+from .tools.data_convert import dict2assignments
+
+def run_deploy(configuration_path):
+    '''configuration_path: it is the folder path which contains the main.sh to launch the deploy script'''
+    import subprocess
+    
+    def run(current_path):
+        try:
+            os.chdir(configuration_path)
+            p = subprocess.Popen("bash main.sh", shell=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+
+            while p.poll() is None:
+                line = p.stdout.readline()
+                if line:
+                    print(line.strip())
+        finally:
+            os.chdir(current_path)
+
+    run(os.getcwd())
+
+
+def build_deploy_script(project_name, config_name):#target_folder, cfg_file_path): #yml_file_path#
+    def yml_file_folder(): return put_folder(os.path.abspath(get_deploy_path(project_name, config_name)))
+    def yml_file_path(): return os.path.join(yml_file_folder(), "main.yml")
+    def host_file(): return os.path.join(yml_file_folder(), debug_simple(get_file_only_name(yml_file_path()), "host file name") + ".host")
+    def bash_file(): return os.path.join(yml_file_folder(), get_file_only_name(yml_file_path()) + ".sh")
+    def get_roles_data():return roles_load(debug_simple(get_config_path(project_name, config_name), "config_path"))
+    def write_playbook(content): open(put_file(yml_file_path()), 'w').write(content)
+
+    # write data to file
+    write_playbook(roles_build(get_roles_data()))
+    # build link for role folders
+    roles_link(get_roles_data(), \
+               debug_simple(yml_file_folder(), "link_root") \
+    )
+
+    # link src folder to deploy/roles/main/files/src for deployment
+    link_src_to_deploy(get_roles_data())
+
+    def default_vals(): return all_defaults(yml_file_folder(), [role["name"] for role in get_roles_data()])
+
+    # build inventory files on roles
+    write_defaults(host_file(), default_vals())
+
+    # write the defaults to cfg file
+    (F(lambda : demjson.encode(update_dict(demjson.decode_file(get_config_path(project_name, config_name)), {"predefined_variables": default_vals()}))) >> \
+     F(lambda content: open(get_config_path(project_name, config_name), 'w').write(content)))()
+
+    # build the bash file
+    open(bash_file(), "w") \
+        .write("sudo ansible-playbook ./{yml_file} -i ./{host_file}" \
+               .format(yml_file = get_file_name(put_file(yml_file_path())), \
+                       host_file = get_file_name(host_file()) \
+               ) \
+        )
+
+
+
+def deploy_config(project_name, config_name):
+    def get_banyan_config():
+        return demjson.decode_file(get_config_path(project_name, config_name))
+    def get_predefined_variables(banyan_config):
+        return banyan_config["predefined_variables"] if "predefined_variables" in banyan_config else {}
+    def get_existing_items_from_host():
+        return (F(filter, _.call("find", "=") != -1) \
+            >> F(map, lambda item: (item.split("=")[0], item.split("=")[1].strip())) \
+            >> F(dict))(open(get_deploy_host(project_name, config_name), 'r').readlines())
+    def save_items_to_host(lines):
+        open(get_deploy_host(project_name, config_name), 'w').write("[all:vars]" + os.linesep + lines)
+
+    (F(get_banyan_config) >> \
+        F(get_predefined_variables) >> \
+        F(update_dict, get_existing_items_from_host()) >> \
+        F(dict2assignments) >> \
+        F(lambda items: os.linesep.join(items)) >> \
+        F(save_items_to_host))()
+
+    
+
+
