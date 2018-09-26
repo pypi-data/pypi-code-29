@@ -1,0 +1,32 @@
+from sqlalchemy.orm import exc as orm_exc
+
+from .response import Result, ServerErrorResult, gen_response, RESP_MSGS
+
+
+class ErrHandler:
+
+    @classmethod
+    def handler_werkzeug_exceptions(cls, e):
+        return Result(gen_response(
+            e.code, RESP_MSGS.get(e.code, e.name),
+            None if not hasattr(e, 'data') else e.data['messages']),
+            status=e.code)
+
+    @classmethod
+    def handler_sqlalchemy_orm_exc(cls, e):
+        code, message, detail = 500, RESP_MSGS[500], repr(e)
+
+        if isinstance(e, orm_exc.NoResultFound):
+            code, message, detail = 404, '源数据未找到', repr(e)
+
+        return Result(gen_response(code, message, detail), status=code)
+
+    @classmethod
+    def handler_others(cls, e):
+        return ServerErrorResult(500, detail=repr(e))
+
+    @classmethod
+    def handler(cls, e):
+        exc = 'others' if not hasattr(e, '__module__') else \
+            e.__module__.replace('.', '_')
+        return getattr(cls, 'handler_{}'.format(exc), 'handler_others')(e)
