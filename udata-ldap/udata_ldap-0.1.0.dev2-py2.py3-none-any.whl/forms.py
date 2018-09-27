@@ -1,0 +1,16 @@
+# -*- coding: utf-8 -*-
+from __future__ import unicode_literals
+
+from flask_security.forms import NextFormMixin, get_form_field_label, password_required
+from wtforms import PasswordField
+
+from udata.forms import Form, fields, validators
+from udata.i18n import lazy_gettext as _
+
+
+class LoginForm(Form, NextFormMixin):
+    username = fields.StringField(_('Username'),
+                                  validators=[validators.required()])
+    password = PasswordField(get_form_field_label('password'),
+                             validators=[password_required])
+    remember = fields.BooleanField(get_form_field_label('remember_me'))
