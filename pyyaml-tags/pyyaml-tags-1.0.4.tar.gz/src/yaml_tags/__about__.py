@@ -1,0 +1,6 @@
+__title__ = 'pyyaml-tags'
+__summary__ = 'PyYAML custom tags'
+__uri__ = 'https://github.com/meiblorn/pyyaml-tags'
+__author__ = 'Vadim Fedorenko (Meiblorn)'
+__email__ = 'meiblorn@gmail.com'
+__license__ = 'MIT'
