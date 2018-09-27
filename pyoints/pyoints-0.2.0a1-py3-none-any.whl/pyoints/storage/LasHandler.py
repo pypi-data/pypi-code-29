@@ -1,0 +1,326 @@
+# BEGIN OF LICENSE NOTE
+# This file is part of Pyoints.
+# Copyright (c) 2018, Sebastian Lamprecht, Trier University,
+# lamprecht@uni-trier.de
+#
+# Pyoints is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# Pyoints is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with Pyoints. If not, see <https://www.gnu.org/licenses/>.
+# END OF LICENSE NOTE
+"""Handling of .las-files.
+"""
+
+import os
+import numpy as np
+import laspy
+
+from ..extent import Extent
+from ..georecords import (
+    GeoRecords,
+    LasRecords,
+)
+from .. import (
+    transformation,
+    projection,
+    assertion,
+    nptools,
+)
+
+from .BaseGeoHandler import GeoFile
+from .dtype_converters import numpy_to_laspy_dtype
+
+
+class LasReader(GeoFile):
+    """Class to read .las-files.
+
+    Parameters
+    ----------
+    infile : String
+        Las file to be read.
+    proj : optional, Proj
+        Spatial reference system. Usually provided only, if the spatial
+        reference of the file has not be set yet.
+
+    See Also
+    --------
+    GeoFile
+
+    """
+
+    def __init__(self, infile, proj=None):
+        GeoFile.__init__(self, infile)
+
+        lasFile = laspy.file.File(self.file, mode='r')
+
+        # try to read projection from WKT
+        if proj is None:
+            for vlr in lasFile.header.vlrs:
+                if vlr.record_id == 2112:
+                    wkt = str(vlr.VLR_body.decode('utf-8'))
+                    proj = projection.Proj.from_wkt(wkt)
+                    break
+        self.proj = proj
+
+        self.t = transformation.t_matrix(lasFile.header.offset)
+        self._extent = Extent((lasFile.header.min, lasFile.header.max))
+        self._count = int(lasFile.header.point_records_count)
+
+        lasFile.close()
+        del lasFile
+
+    def __len__(self):
+        return self._count
+
+    @property
+    def extent(self):
+        return self._extent
+
+    @property
+    def corners(self):
+        return Extent(self.extent[[0, 1, 3, 4]]).corners
+
+    def load(self, extent=None):
+
+        lasFile = laspy.file.File(self.file, mode='r')
+
+        scale = np.array(lasFile.header.scale, dtype=np.float64)
+        offset = np.array(lasFile.header.offset, dtype=np.float64)
+        las_fields = [
+            str(dim.name.encode().decode()) for dim in lasFile.point_format
+        ]  # ugly workaround to get actual strings
+
+        points = lasFile.points['point'].copy().view(np.recarray)
+
+        # Close File
+        lasFile.close()
+        del lasFile
+
+        # filter by extent (before scaling)
+        if extent is not None:
+            ext = Extent(extent)
+            iext = Extent(np.array([
+                (ext.min_corner - offset) / scale,
+                (ext.max_corner - offset) / scale
+            ], dtype='i4'))
+            sIds = iext.intersects([points.X, points.Y, points.Z])
+            points = points[sIds]
+
+        # much faster than accessing lasFile.x
+        coords = np.empty((len(points), 3), dtype=np.float64)
+        coords[:, 0] = points.X * scale[0] + offset[0]
+        coords[:, 1] = points.Y * scale[1] + offset[1]
+        coords[:, 2] = points.Z * scale[2] + offset[2]
+
+        # grep data
+        omit = ['X', 'Y', 'Z']
+        dtypes = []
+        dataDict = {'coords': coords}
+        for name in las_fields:
+            if name == 'flag_byte':
+                values = points.flag_byte
+                if np.any(values):
+                    dataDict['num_returns'] = values // 8
+                    dataDict['return_num'] = values % 8
+            elif name == 'raw_classification':
+                values = points.raw_classification
+                if np.any(values):
+                    dataDict['classification'] = values
+            elif name not in omit:
+                values = points[name]
+                if np.any(values):
+                    dataDict[name] = values
+
+        # create recarray
+        data = nptools.recarray(dataDict, dtype=dtypes)
+
+        if len(points) == 0:
+            return data.view(LasRecords)
+
+        t = transformation.t_matrix(offset)
+        return LasRecords(self.proj, data, T=t)
+
+
+def writeLas(geoRecords, outfile):
+    """ Write a LAS file to disc.
+
+    Parameters
+    ----------
+    geoRecords : GeoRecords
+        Points to store to disk.
+    outfile : String
+        Desired output file.
+
+    """
+    # validate input
+    if not isinstance(geoRecords, GeoRecords):
+        raise TypeError("'geoRecords' needs to be of type 'GeoRecords'")
+    if not os.access(os.path.dirname(outfile), os.W_OK):
+        raise IOError('File %s is not writable' % outfile)
+
+    records = geoRecords.records()
+
+    # Create file header
+    header = laspy.header.Header()
+    header.file_sig = 'LASF'
+    header.format = 1.2
+    header.data_format_id = 3
+
+    # Open file in write mode
+    lasFile = laspy.file.File(outfile, mode='w', header=header)
+
+    # create projection VLR using WKT
+    proj_vlr = laspy.header.VLR(
+        user_id="LASF_Projection",
+        record_id=2112,
+        VLR_body=str.encode(geoRecords.proj.wkt),
+        description="OGC Coordinate System WKT"
+    )
+    proj_vlr.parse_data()
+
+    # set VLRs
+    lasFile.header.set_vlrs([proj_vlr])
+
+    dim = min(geoRecords.dim, 3)
+
+    # find optimal offset and scale scale to achieve highest precision
+    offset = np.zeros(3)
+    scale = np.ones(3)
+
+    offset[:dim] = geoRecords.t.origin
+
+    max_values = np.abs(records.extent().corners - offset[:dim]).max(0)
+    max_digits = 2**30  # long int
+    scale[:dim] = max_values / max_digits
+    scale[np.isclose(scale, 0)] = 1 / max_digits
+
+    lasFile.header.scale = scale
+    lasFile.header.offset = offset
+
+    # get default fields
+    las_fields = [field.name for field in lasFile.point_format]
+    field_names = records.dtype.names
+
+    # Fields to omit
+    omit = []
+    omit.extend(las_fields)
+    omit.extend(np.dtype(LasRecords.USER_DEFINED_FIELDS).names)
+
+    # create user defined fields
+    for name in field_names:
+        if name not in omit:
+            dtype = records.dtype[name]
+            type_id = numpy_to_laspy_dtype(dtype)
+            if type_id is None:
+                omit.append(name)
+            else:
+                lasFile.define_new_dimension(name, type_id, '')
+
+    # initialize
+    if 'return_num' in field_names or 'num_returns' in field_names:
+        lasFile.flag_byte = np.zeros(len(records), dtype=np.uint)
+
+    # set fields
+    for name in field_names:
+        if name == 'coords':
+            lasFile.set_x_scaled(records.coords[:, 0])
+            lasFile.set_y_scaled(records.coords[:, 1])
+            if records.dim > 2:
+                lasFile.set_z_scaled(records.coords[:, 2])
+        elif name == 'classification':
+            lasFile.set_raw_classification(records.classification)
+        elif name == 'return_num':
+            lasFile.flag_byte = lasFile.flag_byte + records.return_num
+        elif name == 'num_returns':
+            lasFile.flag_byte = lasFile.flag_byte + records.num_returns * 8
+        elif name == 'intensity':
+            lasFile.set_intensity(records.intensity)
+        elif name == 'user_data':
+            lasFile.set_user_data(records.user_data)
+        elif name == 'red':
+            lasFile.set_red(records.red)
+        elif name == 'green':
+            lasFile.set_green(records.green)
+        elif name == 'blue':
+            lasFile.set_blue(records.blue)
+        elif name == 'nir':
+            lasFile.set_blue(records.nir)
+        elif name == 'pt_src_id':
+            lasFile.set_pt_src_id(records.pt_src_id)
+        elif name == 'gps_time':
+            lasFile.set_gps_time(records.gps_time)
+        elif name not in omit:
+            lasFile._writer.set_dimension(name, records[name])
+
+    # close file
+    lasFile.header.update_min_max()
+    lasFile.close()
+    del lasFile
+
+
+def _updateLasHeader(las_file, offset=None, translate=None, precision=None):
+    # experimental
+    lasFile = laspy.file.File(las_file, mode='rw')
+
+    if precision is not None:
+        precision = assertion.ensure_numvector(precision)
+        if not len(precision) == 3:
+            raise ValueError('"precision" has to have a length of 3')
+        scale = np.repeat(10.0, 3)**-np.array(precision)
+        lasFile.header.scale = scale
+
+    if offset is not None:
+        offset = assertion.ensure_numvector(offset)
+        if not len(offset) == 3:
+            raise ValueError('"offset" has to have a length of 3')
+        lasFile.header.offset = offset
+
+    if translate is not None:
+        translate = assertion.ensure_numvector(translate)
+        if not len(translate) == 3:
+            raise ValueError('"translate" has to have a length of 3')
+        lasFile.header.offset = lasFile.header.offset + translate
+
+    lasFile.header.update_min_max()
+    lasFile.close()
+    del lasFile
+
+
+def _createTypeTestLas(outfile):
+    # experimental
+
+    # Create file header
+    header = laspy.header.Header()
+    header.file_sig = 'LASF'
+    header.format = 1.2
+    header.data_format_id = 3
+
+    # Open file in write mode
+    lasFile = laspy.file.File(outfile, mode='w', header=header)
+
+    lasFile.header.scale = [1, 1, 1]
+    lasFile.header.offset = [0, 0, 0]
+
+    names = []
+    for type_id in range(1, 31):
+        name = 'field_%i' % type_id
+        if type_id not in [8, 18, 28]:
+            lasFile.define_new_dimension(name, type_id, '')
+            names.append(name)
+
+    k = 10
+    lasFile.x = np.random.rand(k)
+    lasFile.y = np.random.rand(k)
+    lasFile.z = np.random.rand(k)
+
+    lasFile.header.update_min_max()
+    lasFile.close()
+    del lasFile
