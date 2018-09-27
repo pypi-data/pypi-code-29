@@ -1,0 +1,2 @@
+CLI_VERSION = '2.5.2b'
+
