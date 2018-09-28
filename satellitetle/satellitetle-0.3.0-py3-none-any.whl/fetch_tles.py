@@ -1,0 +1,69 @@
+from __future__ import print_function
+
+from sgp4.earth_gravity import wgs72
+from sgp4.io import twoline2rv
+
+from . import get_tle_sources, fetch_tles_from_url, fetch_tle_from_celestrak
+
+
+def fetch_tles(requested_norad_ids):
+    '''
+    Returns the most recent TLEs found for the requested satellites
+    available via Celestrak, CalPoly and AMSAT.
+    '''
+
+    # List of 2-tuples of the form (source, tle)
+    # source is a human-readable string
+    # tle is a 3-tuple of strings
+    tles = dict()
+
+    def update_tles(source, tle):
+        if norad_id not in requested_norad_ids:
+            # Satellite not requested,
+            # skip.
+            return
+
+        if norad_id not in tles.keys():
+            # Satellite requested and first occurence in the downloaded data,
+            # store new TLE.
+            print('Found {}'.format(norad_id))
+            tles[norad_id] = source, tle
+            return
+
+        # There are multiple TLEs for this satellite available.
+        # Parse and compare epoch of both TLEs and choose the most recent one.
+        current_sat = twoline2rv(tles[norad_id][1][1], tles[norad_id][1][2], wgs72)
+        new_sat = twoline2rv(tle[1], tle[2], wgs72)
+        if new_sat.epoch > current_sat.epoch:
+            # Found a more recent TLE than the current one,
+            # store the new TLE.
+            print('Updated {}, epoch '.format(norad_id), end='')
+            print('{:%Y-%m-%d %H:%M:%S} > {:%Y-%m-%d %H:%M:%S}'.format(
+                  new_sat.epoch,
+                  current_sat.epoch))
+            tles[norad_id] = source, tle
+
+    # Fetch TLE sets from well-known TLE sources
+    sources = get_tle_sources()
+
+    for source, url in sources:
+        print('Fetch from {}'.format(url))
+        new_tles = fetch_tles_from_url(url=url)
+
+        for norad_id, tle in new_tles.items():
+            update_tles(source, tle)
+
+    # Try fetching missing sats from another Celestrak endoint
+    missing_norad_ids = set(requested_norad_ids) - set(tles.keys())
+
+    for norad_id in missing_norad_ids:
+        try:
+            print('Fetching {} from Celestrak (satcat):'.format(norad_id), end='')
+            tle = fetch_tle_from_celestrak(norad_id)
+            print(' ok, ', end='')
+            update_tles('Celestrak (satcat)', tle)
+        except LookupError:
+            print(' failed.')
+            continue
+
+    return tles
