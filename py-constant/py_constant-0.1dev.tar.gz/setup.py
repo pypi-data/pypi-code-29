@@ -1,0 +1,12 @@
+from distutils.core import setup
+
+setup(
+    name='py_constant',
+    version='0.1dev',
+    packages=['py_constant',],
+    license='Creative Commons Attribution-Noncommercial-Share Alike license',
+    long_description=open('README.md').read(),
+    url='https://github.com/mihagrgicjelen/python-constant',
+    author='Miha Grgic Jelen',
+    author_email='miha.grgic.jelen@gmail.com'
+)
