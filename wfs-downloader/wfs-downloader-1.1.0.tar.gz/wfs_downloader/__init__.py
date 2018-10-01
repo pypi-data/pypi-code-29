@@ -1,0 +1,6 @@
+__title__ = 'wfs-downloader'
+__version__ = '1.1.0'
+__author__ = 'Jochen Klar'
+__email__ = 'jochenklar@gmail.com'
+__license__ = 'MIT'
+__copyright__ = 'Copyright 2017-2018 Jochen Klar'
