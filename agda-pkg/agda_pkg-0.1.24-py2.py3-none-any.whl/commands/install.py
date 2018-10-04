@@ -1,0 +1,528 @@
+'''
+  apkg
+  ~~~~
+
+  The Agda Package Manager.
+
+'''
+
+# ----------------------------------------------------------------------------
+
+import click
+
+import git
+import humanize
+import os
+import random
+import requests
+import subprocess
+import time
+import uuid
+
+from distutils.dir_util  import copy_tree, remove_tree
+from pathlib             import Path
+from pony.orm            import *
+from tempfile            import TemporaryDirectory
+
+from ..config            import ( PACKAGE_SOURCES_PATH
+                                , INDEX_REPOSITORY_PATH
+                                , PKG_SUFFIX
+                                , GITHUB_DOMAIN 
+                                , LIB_SUFFIX
+                                , GITHUB_API
+                                )
+
+from ..service.database           import db
+from ..service.database           import ( Library
+                                         , LibraryVersion
+                                         , Keyword
+                                         , Dependency
+                                         )
+
+from ..service.logging            import logger, clog
+from ..service.readLibFile        import readLibFile
+from ..service.writeAgdaDirFiles  import writeAgdaDirFiles
+from ..service.utils              import isURL, isGit, isIndexed, isLocal
+
+from .uninstall                   import uninstallLibrary
+
+# ----------------------------------------------------------------------------
+
+# ----------------------------------------------------------------------------
+# -- Install command variants
+
+# -- Command def.
+@click.group()
+def install(): pass
+
+# ----------------------------------------------------------------------------
+@db_session
+def installFromLocal(pathlib, name, src, version, no_defaults, cache, yes):
+  logger.info("Installing as a local package...")
+
+  if len(pathlib) == 0 or pathlib == ".":
+    pathlib = Path().cwd()
+  else:
+    pathlib = Path(pathlib)
+
+  pwd = pathlib.joinpath(Path(src))
+
+  if not Path(pwd).exists():
+    logger.error(pwd + " doesn't exist!")
+    return None
+  
+  # logger.info("Library location: " + pwd.as_posix())
+
+  agdaLibFiles = [ f for f in pwd.glob(name + LIB_SUFFIX) if f.is_file() ]
+  agdaPkgFiles = [ f for f in pwd.glob(name + PKG_SUFFIX) if f.is_file() ]
+
+  if len(agdaLibFiles) == 0 and len(agdaPkgFiles) == 0:
+    logger.error("No libraries (" + LIB_SUFFIX + " or "\
+                + PKG_SUFFIX + ") files detected." )
+    return None
+
+  libFile = Path("")
+  
+  # -- TODO: offer the posibility to create a file agda-pkg!
+  if len(agdaPkgFiles) == 1:
+    libFile = agdaPkgFiles[0]
+  elif len(agdaLibFiles) == 1:
+    # -- TODO: offer the posibility ssto create a file agda-pkg!
+    libFile = agdaLibFiles[0]
+  else:
+    logger.error("None or many agda libraries files.")
+    logger.info("[!] Use --name to specify the library name.")
+    return None
+
+  logger.info("Library file detected: " + libFile.name)
+  info = readLibFile(libFile)
+
+  name = info.get("name", "")
+  if len(name) == 0:
+    name = pathlib.name
+  # logger.info("Library name: " + name)
+
+  # -- Let's attach a version number
+
+  versionName = version
+
+  if versionName == "":
+    versionName = str(info.get("version", ""))
+  if versionName == "" and pwd.joinpath(".git").exists():
+    try:
+      with open(os.devnull, 'w') as devnull:
+        result = subprocess.run( ["git", "describe", "--tags", "--long"]
+                               , stdout=subprocess.PIPE
+                               , stderr=devnull
+                               , cwd=pwd.as_posix()
+                               )
+        versionName = result.stdout.decode()
+    except: pass
+
+  if versionName == "" and pwd.joinpath(".git").exists():
+    try:
+      with open(os.devnull, 'w') as devnull:
+        result = subprocess.run( ["git", "rev-parse", "HEAD"]
+                               , stdout=subprocess.PIPE
+                               , stderr=devnull
+                               , cwd=pwd.as_posix()
+                               )
+        versionName = result.stdout.decode()[:8]
+    except: pass
+
+  if versionName == "": 
+    versionName = str(uuid.uuid1())
+
+  logger.info("Library version: " + versionName)
+
+  # At this point we have the name from the local library
+  library = Library.get(name=name)
+
+  if library is None:
+    library = Library(name=name)
+
+  versionLibrary = LibraryVersion.get(library=library, name=versionName)
+
+  if versionLibrary is not None:
+
+    if versionLibrary.installed:
+      logger.warning("This version ({}) is already installed."
+                      .format(versionLibrary.freezeName))
+      if yes or click.confirm('Do you want to uninstall it first?'):
+        try:
+          uninstallLibrary(libname=name, database=False, remove_cache=True)
+        except Exception as e:
+          logger.error(e)
+          return None
+      else:
+        
+        versionNameProposed = "{}-{}".format(versionName, uuid.uuid1())
+        logger.warning("Renaming version to " + name + "@" + versionNameProposed)
+        if click.confirm('Do you want to install it using this version?', abort=True):
+          versionLibrary = LibraryVersion( library=library
+                                         , name=versionNameProposed
+                                         )
+  else:
+    versionLibrary = LibraryVersion( library=library
+                                   , name=versionName
+                                   , cached=True
+                                   )
+
+  try:
+
+    if versionLibrary.sourcePath.exists():
+      remove_tree(versionLibrary.sourcePath.as_posix())
+
+    logger.info("Adding " + versionLibrary.sourcePath.as_posix())
+    copy_tree(pwd.as_posix(), versionLibrary.sourcePath.as_posix())
+
+  except Exception as e:
+    logger.error(e)
+    logger.error("Fail to copy directory (" + pwd.as_posix() + ")") 
+    return None
+    
+  commit()
+
+  try:
+    info = versionLibrary.readInfoFromLibFile()
+
+    keywords = info.get("keywords", []) + info.get("category", [])
+    keywords = list(set(keywords))
+
+    for word in keywords:
+
+      keyword = Keyword.get_for_update(word=word)
+
+      if keyword is None:
+        keyword = Keyword(word = word)
+      
+      if not library in keyword.libraries:
+        keyword.libraries.add(library)
+
+      if not versionLibrary in keyword.libVersions:
+        keyword.libVersions.add(versionLibrary)
+
+    for depend in info.get("depend",[]):
+
+      if type(depend) == list:
+        logger.info("no supported yet but the format is X.X <= name <= Y.Y")
+      else:
+        dependency = Library.get(name=depend)
+        if dependency is not None:
+          versionLibrary.depend.add(Dependency(library=dependency))
+        else:
+          logger.warning(depend + " is not in the index")
+    
+    versionLibrary.install(not(no_defaults))
+
+    commit()
+    return versionLibrary
+
+  except Exception as e:
+    try:
+      if versionLibrary.sourcePath.exists():
+        remove_tree(versionLibrary.sourcePath.as_posix())
+    except:
+      logger.error(" fail to remove the sources: {}"
+                  .format(versionLibrary.sourcePath.as_poasix())
+                  )
+
+    logger.error(e)
+    return None
+
+
+# ----------------------------------------------------------------------------
+def installFromGit(url, name, src, version, no_defaults, cache, branch, yes):
+
+  logger.info("Installing from git: %s" % url )
+
+  if not isGit(url):
+    logger.error("this is not a git repository")
+    return None
+
+  # tmpdir = "/tmp/qwerty"
+  # if True:
+  with TemporaryDirectory() as tmpdir:
+    print("Using temporal directory:", tmpdir)
+    try:
+      if branch is None: branch = "master"
+      if Path(tmpdir).exists():
+        remove_tree(tmpdir)
+
+      # To display a nice progress bar, we need the size of
+      # the repository, so let's try to get that number
+
+      # -- SIZE Repo
+
+      size = 0
+      if "github" in url:
+        reporef = url.split("github.com")[-1]
+        infourl = GITHUB_API + reporef.split(".git")[0]
+
+        response = requests.get(infourl, stream=True)
+
+        if not response.ok:
+          logger.error("Request failed: %d" % response.status_code)
+          return None
+
+        info = response.json()
+        size = int(info.get("size", 0))
+
+      else:
+        
+        response = requests.get(url, stream=True)
+        if not response.ok:
+          logger.error("Request failed: %d" % response.status_code)
+          return None
+
+        size_length = response.headers.get('content-length')
+        size = 0
+        if size_length is None:
+          for block in response.iter_content(1024):
+              size += 1024
+        else:
+          size = size_length
+        size = int(size)
+
+      # --
+
+      logger.info("Downloading " + url  \
+            + " (%s)" % str(humanize.naturalsize(size, binary=True)))
+      
+      with click.progressbar(
+                    length=10*size
+                  # , label = ""
+                  , bar_template='|%(bar)s| %(info)s %(label)s'
+                  , fill_char=click.style('█', fg='cyan')
+                  , empty_char=' '
+                  , width=30
+                  ) as bar:
+
+        class Progress(git.remote.RemoteProgress):
+          
+          total, past = 0 , 0
+
+          def update(self, op_code, cur_count, max_count=None, message=''):
+
+            if cur_count < 10:
+              self.past = self.total
+            self.total = self.past + int(cur_count)
+
+            bar.update(self.total)
+
+        REPO = git.Repo.clone_from( url
+                                  , tmpdir
+                                  , branch=branch
+                                  , progress=Progress()
+                                  )
+
+      if version != "":
+        try:
+          # Seen on https://goo.gl/JVs8jJ
+          REPO.git.checkout(version)
+
+        except Exception as e:
+          logger.error(e)
+          logger.error(" version or tag not found ({})".format(version))
+          return None
+
+      libVersion = installFromLocal(tmpdir,name,src,version,no_defaults,cache,yes)
+
+      if libVersion is None:
+        logger.error(" we couldn't install the version you specified.")
+        return None
+
+      libVersion.fromGit = True
+      libVersion.origin = url
+      libVersion.library.url = url
+      libVersion.library.default = not(no_defaults)
+
+      if version != "": libVersion.sha = REPO.head.commit.hexsha
+      commit()
+      return libVersion
+
+    except Exception as e:
+      logger.error(e)
+      logger.error("Problems to install the library, may you want to run init?")
+      return None
+
+# ----------------------------------------------------------------------------
+@db_session
+def installFromIndex(libname, src, version, no_defaults, cache, yes):
+
+  # Check first if the library is in the cache
+  logger.info("Installing from the index...")
+
+  library = Library.get(name=libname)
+
+  if library is not None:
+
+    versionLibrary = None
+    if version == "":
+      # we'll try to install the latest git version
+      for v in library.getSortedVersions():
+        if v.fromGit and v.fromIndex:
+          versionLibrary = v
+          version        = versionLibrary.name
+          break
+    else:
+      versionLibrary = LibraryVersion.get( library=library
+                                     , name=version
+                                     , fromIndex=True
+                                     , fromGit=True
+                                     )
+    
+    if versionLibrary is None:
+      logger.error(" no versions for this library.\n\
+                    Index may be corrupted. Try $ apkg init")
+      return None
+    
+    if versionLibrary.installed:
+      logger.info("Requirement already satisfied.")
+      return versionLibrary
+
+    elif versionLibrary.cached and \
+      (yes or click.confirm('Do you want to install the cached version?')):
+        versionLibrary.install()
+        return versionLibrary
+
+    else:
+      url = versionLibrary.library.url
+      versionLibrary = installFromGit(url, libname, src, version
+                                     , no_defaults, cache, "master", yes)
+      if versionLibrary is not None:
+        versionLibrary.fromIndex = True
+        versionLibrary.cached    = True
+
+      return versionLibrary
+  else:
+    logger.error("Library not available.")
+    return None
+
+# ----------------------------------------------------------------------------
+def installFromURL(url, name, src, version, no_defaults, cache, yes):
+  logger.info("Command not available yet")
+  return None
+
+# ----------------------------------------------------------------------------
+@install.command()
+@click.argument('libnames', nargs=-1)
+@click.option('--src'
+             , type=str
+             , default=""
+             , help='Directory to the source.')
+@click.option('--version'
+             , type=str
+             , default=""
+             , help='Version, tag or commit.')
+@click.option('--no-defaults'
+             , type=bool
+             , is_flag=True 
+             , help='No default library.')
+@click.option('--cache'
+             , type=bool
+             , is_flag=True
+             , default=True
+             , help='Cache available.')
+@click.option('--local'
+             , type=bool
+             , is_flag=True 
+             , help='Force to install just local packages.')
+@click.option('--name'
+             , type=str
+             , default="*"
+             , help='Help to disambiguate when many lib files are\
+                     present in the directory.')
+@click.option('--url'
+             , type=bool
+             , is_flag=True 
+             , help='From a url address.')
+@click.option('--git'
+             , type=bool
+             , is_flag=True 
+             , help='From a git repository.')
+@click.option('--github'
+             , type=bool
+             , is_flag=True 
+             , help='From a github repository.')
+@click.option('--branch'
+             , type=bool
+             , is_flag=True 
+             , help='From a git repository.')
+@click.option('-r'
+             , '--requirement'
+             , type=click.Path(exists=True)
+             , help='Use a requirement file.')
+@click.option('--yes'
+             , type=bool
+             , is_flag=True 
+             , help='Yes for everything.')
+@clog.simple_verbosity_option(logger)
+@click.pass_context
+@db_session
+def install( ctx, libnames, src, version, no_defaults \
+           , cache, local, name, url, git, github, branch, requirement, yes):
+  """Install packages."""
+
+  libnames = list(set(libnames))
+
+  if requirement:
+    try:
+      rfile = Path(requirement)
+      libnames += rfile.read_text().split()
+    except Exception as e:
+      logger.error(e)
+      logger.error(" installation failed.")
+      return
+
+
+  if len(libnames) > 1 and version != "":
+    return logger.error("--version only works with one library.\n\
+      Consider using nameLibrary@versionNumber instead.")
+  
+  if (git or github) and url:
+    return logger.error("--git and --url are incompatible")
+
+  if len(libnames) == 0: libnames = ["."]
+
+  if github: git = True
+
+  for libname in libnames:
+
+    if "@" in libname:
+      libname, version = libname.split("@")
+    elif "==" in libname:
+      libname, version = libname.split("==")
+
+    if github: 
+      if not libname.startswith(GITHUB_DOMAIN):
+        libname = GITHUB_DOMAIN + libname
+      if not libname.endswith(".git"):
+        libname = libname + ".git"
+
+    pathlib  = libname
+    url      = libname
+    vLibrary = None
+
+    try:  
+      if local:
+        vLibrary = installFromLocal(pathlib,name,src,version,no_defaults,cache,yes)
+      elif isIndexed(libname):
+        vLibrary = installFromIndex(libname,src,version,no_defaults,cache,yes)
+      elif git or isGit(libname):
+        vLibrary = installFromGit(url,name,src,version,no_defaults,cache,branch,yes)
+      elif isLocal(pathlib):
+        vLibrary  = installFromLocal(pathlib,name,src,version,no_defaults,cache,yes)
+
+    except Exception as e:
+      logger.error("Unsuccessfully installation {}."
+                  .format(libname if name =="*" else name))
+      continue
+    
+    if vLibrary is not None:
+      logger.info("Successfully installed ({}@{})."
+                 .format(libname if name =="*" else name, vLibrary.name))
+    else:
+      logger.info("Unsuccessfully installation ({})."
+                 .format(libname if name =="*" else name))
+  writeAgdaDirFiles()
