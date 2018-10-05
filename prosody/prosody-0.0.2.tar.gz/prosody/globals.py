@@ -1,0 +1,1 @@
+VOICE_END_POINT = 'https://tts.humelo.com/ttsapi/voicegens/'
