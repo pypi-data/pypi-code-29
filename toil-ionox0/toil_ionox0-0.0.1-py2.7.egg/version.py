@@ -1,0 +1,13 @@
+dockerShortTag = '3.15.1a1-d605ffe'
+baseVersion = '3.15.1a1'
+dockerTag = '3.15.1a1-d605ffe2e62115a702abdf5dbb11c9c29fe1e802'
+dockerName = 'toil'
+buildNumber = None
+cgcloudVersion = '1.6.0a1.dev393'
+version = '3.15.1a1-d605ffe2e62115a702abdf5dbb11c9c29fe1e802'
+dirty = False
+shortVersion = '3.15.1a1-d605ffe'
+currentCommit = 'd605ffe2e62115a702abdf5dbb11c9c29fe1e802'
+dockerMinimalTag = '3.15.1a1'
+distVersion = '3.15.1a1'
+dockerRegistry = 'quay.io/ucsc_cgl'
