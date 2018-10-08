@@ -1,0 +1,17 @@
+'''
+AUTHOR: DAMU 牟文斌
+VERSION: V1.0.000
+DESC: 打包当前PYTHON程序包的模块
+'''
+from distutils.core import setup
+
+
+# 具体打包信息
+setup(
+    name="py08tools",  # 发布的包文件名称
+    version="1.00.001",  # 发布的包的版本序号
+    description="注释说明~当前程序包的使用说明",  # 发布包的描述信息
+    author="大牧莫邪",  # 发布包的作者信息
+    author_email="damu@163.com",  # 作者联系邮箱信息
+    py_modules=["__init__", "download", "engine", "funcs", "logging", "middlewares", "modules", "pipelines", "schdular", "spider", "tools", "utils"]  # 发布的包中的模块文件 列表
+)
